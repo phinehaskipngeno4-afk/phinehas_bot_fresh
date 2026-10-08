@@ -1,6 +1,6 @@
 import express from 'express';
 import QRCode from 'qrcode';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, getContentType } from '@whiskeysockets/baileys';
 import { GoogleGenAI } from '@google/genai';
 
 const app = express();
@@ -12,7 +12,10 @@ let isConnected = false;
 // Initialize Gemini Client
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-// Fallback Model List (resolves 404/deprecation issues)
+// Persistent Chat Sessions Map (remoteJid -> Gemini Chat Object)
+const activeChats = new Map();
+
+// Model Fallback Hierarchy
 const MODEL_FALLBACKS = [
   'gemini-3.4-flash',
   'gemini-3.5-flash',
@@ -21,30 +24,87 @@ const MODEL_FALLBACKS = [
   'gemini-3.8-flash'
 ];
 
-async function generateWithFallback(prompt) {
-  for (const modelName of MODEL_FALLBACKS) {
+const SYSTEM_INSTRUCTION = `You are Phinehas. Respond directly as yourself in a natural, casual, and friendly human tone—just like texting a close friend on WhatsApp.
+
+IDENTITY & CORE PERSONA:
+1. NEVER refer to yourself as an AI, bot, language model, or assistant.
+2. Avoid generic corporate language like "How can I help you?", "As an AI...", or "Feel free to ask."
+3. Keep responses concise, relaxed, and tailored for WhatsApp messaging.
+
+RIDDLES, GAMES & TRIVIA:
+4. If you ask a riddle or question and the user gives up, asks for the answer ("what could it be?", "I don't know", "tell me"), ALWAYS give the answer to THAT exact riddle immediately. Never ask "what were we talking about?" or give a new riddle before resolving the active one.
+
+CONVERSATION & MEMORY:
+5. Remember the recent messages in the conversation. Do not repeat riddles or questions you or the user recently asked.
+6. Match the user's energy and language style (e.g., casual slang, Sheng, or everyday English where appropriate).`;
+
+/**
+ * Sends a message using an existing chat or handles model fallbacks
+ */
+async function sendChatMessageWithFallback(remoteJid, textMessage) {
+  if (activeChats.has(remoteJid)) {
     try {
-      const response = await ai.models.generateContent({
-        model: modelName,
-        contents: prompt,
-        config: {
-          systemInstruction: "You are Phinehas, a helpful and friendly AI assistant."
-        }
-      });
+      const chat = activeChats.get(remoteJid);
+      // ✅ FIX: Pass as { message: textMessage }
+      const response = await chat.sendMessage({ message: textMessage });
       return response;
     } catch (error) {
-      console.warn(`Model ${modelName} failed (${error.status || error.message}). Trying next fallback...`);
+      console.warn(`Chat session for ${remoteJid} failed. Clearing chat and retrying fallback model...`);
+      activeChats.delete(remoteJid);
     }
   }
+
+  for (const modelName of MODEL_FALLBACKS) {
+    try {
+      const chat = ai.chats.create({
+        model: modelName,
+        config: { systemInstruction: SYSTEM_INSTRUCTION }
+      });
+
+      // ✅ FIX: Pass as { message: textMessage }
+      const response = await chat.sendMessage({ message: textMessage });
+      activeChats.set(remoteJid, chat);
+      return response;
+    } catch (error) {
+      console.warn(`Model ${modelName} failed (${error.message}). Trying next...`);
+    }
+  }
+
   throw new Error("All Gemini model fallbacks failed.");
 }
 
-// HTTP Server Route to View QR Code
+function extractTextMessage(rawMessage) {
+  if (!rawMessage) return null;
+
+  let msg = rawMessage;
+
+  // Unwrap View-Once wrappers if present
+  if (msg.viewOnceMessage) msg = msg.viewOnceMessage.message;
+  if (msg.viewOnceMessageV2) msg = msg.viewOnceMessageV2.message;
+  if (msg.viewOnceMessageV2Extension) msg = msg.viewOnceMessageV2Extension.message;
+
+  const contentType = getContentType(msg);
+  if (!contentType) return null;
+
+  if (contentType === 'conversation') {
+    return msg.conversation;
+  } else if (contentType === 'extendedTextMessage') {
+    return msg.extendedTextMessage?.text;
+  } else if (contentType === 'imageMessage') {
+    return msg.imageMessage?.caption || null;
+  } else if (contentType === 'videoMessage') {
+    return msg.videoMessage?.caption || null;
+  }
+
+  return null;
+}
+
+// Web Route for Displaying QR Code
 app.get('/qr', async (req, res) => {
   if (isConnected) {
     return res.send(`
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;">
-        <h2 style="color: #2e7d32;">✅ WhatsApp Bot is already connected and active!</h2>
+        <h2 style="color: #2e7d32;">✅ WhatsApp Bot is active!</h2>
       </div>
     `);
   }
@@ -52,7 +112,7 @@ app.get('/qr', async (req, res) => {
   if (!currentQR) {
     return res.send(`
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;">
-        <h3>⏳ QR Code generating... Please refresh in a few seconds.</h3>
+        <h3>⏳ QR Code generating... Refreshing...</h3>
         <script>setTimeout(() => location.reload(), 3000);</script>
       </div>
     `);
@@ -64,7 +124,6 @@ app.get('/qr', async (req, res) => {
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;">
         <h2>Scan to Link Phinehas WhatsApp Bot</h2>
         <img src="${qrImage}" style="width:300px;height:300px;border:1px solid #ccc;padding:10px;border-radius:8px;"/>
-        <p>Page auto-refreshes every 15 seconds if QR code updates.</p>
         <script>setTimeout(() => location.reload(), 15000);</script>
       </div>
     `);
@@ -73,12 +132,10 @@ app.get('/qr', async (req, res) => {
   }
 });
 
-// Root route for Back4App health checks
 app.get('/', (req, res) => {
   res.send('Phinehas Bot status: Active');
 });
 
-// Start WhatsApp Bot
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
@@ -105,7 +162,7 @@ async function startBot() {
     } else if (connection === 'open') {
       isConnected = true;
       currentQR = '';
-      console.log('🤖 AI WhatsApp Assistant is online and thinking as Phinehas!');
+      console.log('🤖 WhatsApp Assistant is online as Phinehas!');
     }
   });
 
@@ -116,14 +173,14 @@ async function startBot() {
       if (!msg.message || msg.key.fromMe) continue;
 
       const remoteJid = msg.key.remoteJid;
-      const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text;
+      const textMessage = extractTextMessage(msg.message);
 
       if (!textMessage) continue;
 
       console.log(`📬 Message from ${remoteJid}: ${textMessage}`);
 
       try {
-        const response = await generateWithFallback(textMessage);
+        const response = await sendChatMessageWithFallback(remoteJid, textMessage);
         await sock.sendMessage(remoteJid, { text: response.text });
         console.log(`📩 Sent reply to ${remoteJid}`);
       } catch (error) {
@@ -133,7 +190,6 @@ async function startBot() {
   });
 }
 
-// Start HTTP Server & Bot Engine
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
   startBot();
