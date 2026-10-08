@@ -1,6 +1,6 @@
 import express from 'express';
 import QRCode from 'qrcode';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, getContentType } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, getContentType, downloadMediaMessage } from '@whiskeysockets/baileys';
 import { GoogleGenAI } from '@google/genai';
 
 const app = express();
@@ -41,12 +41,12 @@ CONVERSATION & MEMORY:
 /**
  * Sends a message using an existing chat or handles model fallbacks
  */
-async function sendChatMessageWithFallback(remoteJid, textMessage) {
+async function sendChatMessageWithFallback(remoteJid, messageInput) {
   if (activeChats.has(remoteJid)) {
     try {
       const chat = activeChats.get(remoteJid);
       // ✅ FIX: Pass as { message: textMessage }
-      const response = await chat.sendMessage({ message: textMessage });
+      const response = await chat.sendMessage({ message: messageInput });
       return response;
     } catch (error) {
       console.warn(`Chat session for ${remoteJid} failed. Clearing chat and retrying fallback model...`);
@@ -62,7 +62,7 @@ async function sendChatMessageWithFallback(remoteJid, textMessage) {
       });
 
       // ✅ FIX: Pass as { message: textMessage }
-      const response = await chat.sendMessage({ message: textMessage });
+      const response = await chat.sendMessage({ message: messageInput });
       activeChats.set(remoteJid, chat);
       return response;
     } catch (error) {
@@ -73,30 +73,61 @@ async function sendChatMessageWithFallback(remoteJid, textMessage) {
   throw new Error("All Gemini model fallbacks failed.");
 }
 
-function extractTextMessage(rawMessage) {
-  if (!rawMessage) return null;
+async function parseMessagePayload(rawMessage, fullMessageCtx) {
+  if (!rawMessage) return { text: null, mediaPart: null };
 
   let msg = rawMessage;
 
-  // Unwrap View-Once wrappers if present
-  if (msg.viewOnceMessage) msg = msg.viewOnceMessage.message;
-  if (msg.viewOnceMessageV2) msg = msg.viewOnceMessageV2.message;
-  if (msg.viewOnceMessageV2Extension) msg = msg.viewOnceMessageV2Extension.message;
+  // 1. Safe view-once unwrapping
+  if (msg?.viewOnceMessage?.message) msg = msg.viewOnceMessage.message;
+  else if (msg?.viewOnceMessageV2?.message) msg = msg.viewOnceMessageV2.message;
+  else if (msg?.viewOnceMessageV2Extension?.message) msg = msg.viewOnceMessageV2Extension.message;
 
   const contentType = getContentType(msg);
-  if (!contentType) return null;
+  if (!contentType) return { text: null, mediaPart: null };
 
+  // 2. Extract text caption or message
+  let extractedText = null;
   if (contentType === 'conversation') {
-    return msg.conversation;
+    extractedText = msg.conversation;
   } else if (contentType === 'extendedTextMessage') {
-    return msg.extendedTextMessage?.text;
+    extractedText = msg.extendedTextMessage?.text;
   } else if (contentType === 'imageMessage') {
-    return msg.imageMessage?.caption || null;
+    extractedText = msg.imageMessage?.caption || null;
   } else if (contentType === 'videoMessage') {
-    return msg.videoMessage?.caption || null;
+    extractedText = msg.videoMessage?.caption || null;
   }
 
-  return null;
+  // 3. Extract media buffer (for view-once or regular media)
+  let mediaPart = null;
+  const isImage = contentType === 'imageMessage';
+  const isVideo = contentType === 'videoMessage';
+
+  if (isImage || isVideo) {
+    try {
+      const buffer = await downloadMediaMessage(
+        fullMessageCtx,
+        'buffer',
+        {},
+        { logger: console }
+      );
+
+      const mimeType = isImage 
+        ? (msg.imageMessage?.mimetype || 'image/jpeg') 
+        : (msg.videoMessage?.mimetype || 'video/mp4');
+
+      mediaPart = {
+        inlineData: {
+          data: buffer.toString('base64'),
+          mimeType: mimeType
+        }
+      };
+    } catch (err) {
+      console.error('Failed to download media buffer:', err);
+    }
+  }
+
+  return { text: extractedText, mediaPart };
 }
 
 // Web Route for Displaying QR Code
@@ -167,27 +198,35 @@ async function startBot() {
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+  if (type !== 'notify') return;
 
-    for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
+  for (const msg of messages) {
+    if (!msg.message || msg.key.fromMe) continue;
 
-      const remoteJid = msg.key.remoteJid;
-      const textMessage = extractTextMessage(msg.message);
+    const remoteJid = msg.key.remoteJid;
+    const { text, mediaPart } = await parseMessagePayload(msg.message, msg);
 
-      if (!textMessage) continue;
-
-      console.log(`📬 Message from ${remoteJid}: ${textMessage}`);
-
-      try {
-        const response = await sendChatMessageWithFallback(remoteJid, textMessage);
-        await sock.sendMessage(remoteJid, { text: response.text });
-        console.log(`📩 Sent reply to ${remoteJid}`);
-      } catch (error) {
-        console.error('Gemini API Error:', error);
-      }
+    // Prepare content for Gemini (handles text, media, or both)
+    let messageInput = text;
+    if (mediaPart && text) {
+      messageInput = [mediaPart, text];
+    } else if (mediaPart) {
+      messageInput = [mediaPart, "Describe or analyze this media content."];
     }
-  });
+
+    if (!messageInput) continue;
+
+    console.log(`📩 Message from ${remoteJid}:`, text || '[Media Message]');
+
+    try {
+      const response = await sendChatMessageWithFallback(remoteJid, messageInput);
+      await sock.sendMessage(remoteJid, { text: response.text });
+      console.log(`📬 Sent reply to ${remoteJid}`);
+    } catch (error) {
+      console.error('Gemini API Error:', error);
+    }
+  }
+});
 }
 
 app.listen(PORT, () => {
