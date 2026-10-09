@@ -17,11 +17,15 @@ const activeChats = new Map();
 
 // Model Fallback Hierarchy
 const MODEL_FALLBACKS = [
+  'gemini-3.0-flash',
+  'gemini-3.1-flash',
+  'gemini-3.2-flash',
   'gemini-3.4-flash',
   'gemini-3.5-flash',
   'gemini-3.6-flash',
   'gemini-3.7-flash',
-  'gemini-3.8-flash'
+  'gemini-3.8-flash',
+  'gemini-flash-latest'
 ];
 
 const SYSTEM_INSTRUCTION = `You are Phinehas. Respond directly as yourself in a natural, casual, and friendly human tone—just like texting a close friend on WhatsApp.
@@ -41,36 +45,56 @@ CONVERSATION & MEMORY:
 /**
  * Sends a message using an existing chat or handles model fallbacks
  */
+// Helper delay function
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function sendChatMessageWithFallback(remoteJid, messageInput) {
+  let existingHistory = [];
+
+  // 1. Try sending with the active chat session
   if (activeChats.has(remoteJid)) {
+    const chat = activeChats.get(remoteJid);
     try {
-      const chat = activeChats.get(remoteJid);
-      // ✅ FIX: Pass as { message: textMessage }
       const response = await chat.sendMessage({ message: messageInput });
       return response;
     } catch (error) {
-      console.warn(`Chat session for ${remoteJid} failed. Clearing chat and retrying fallback model...`);
+      console.warn(`Chat session for ${remoteJid} failed. Migrating history to fallback model...`);
+      
+      // Save history before deleting failed chat instance
+      try {
+        existingHistory = await chat.getHistory();
+      } catch (histErr) {
+        existingHistory = chat._history || [];
+      }
+      
       activeChats.delete(remoteJid);
     }
   }
 
+  // 2. Iterate through fallbacks if active session fails or doesn't exist
   for (const modelName of MODEL_FALLBACKS) {
     try {
       const chat = ai.chats.create({
         model: modelName,
+        history: existingHistory, // Preserves conversation context across models
         config: { systemInstruction: SYSTEM_INSTRUCTION }
       });
 
-      // ✅ FIX: Pass as { message: textMessage }
       const response = await chat.sendMessage({ message: messageInput });
       activeChats.set(remoteJid, chat);
       return response;
     } catch (error) {
-      console.warn(`Model ${modelName} failed (${error.message}). Trying next...`);
+      // Handle high demand / quota rate limits (429) with a short pause before trying next
+      if (error.status === 429) {
+        console.warn(`Model ${modelName} rate limited (429). Waiting 2s before switching fallback...`);
+        await delay(2000);
+      } else {
+        console.warn(`Model ${modelName} failed (${error.message}). Trying next...`);
+      }
     }
   }
 
-  throw new Error("All Gemini model fallbacks failed.");
+  throw new Error("All Gemini model fallbacks failed or rate limit exceeded.");
 }
 
 async function parseMessagePayload(rawMessage, fullMessageCtx) {
@@ -90,51 +114,54 @@ async function parseMessagePayload(rawMessage, fullMessageCtx) {
       msg?.viewOnceMessageV2Extension?.message;
   }
 
-  const contentType = getContentType(msg);
-  if (!contentType) return { text: null, mediaPart: null };
-  // 2. Extract text caption or message
-  let extractedText = null;
-  if (contentType === 'conversation') {
-    extractedText = msg.conversation;
-  } else if (contentType === 'extendedTextMessage') {
-    extractedText = msg.extendedTextMessage?.text;
-  } else if (contentType === 'imageMessage') {
-    extractedText = msg.imageMessage?.caption || null;
-  } else if (contentType === 'videoMessage') {
-    extractedText = msg.videoMessage?.caption || null;
-  }
+  // Replace line 93 with this safer content type resolver:
+const contentType = getContentType(msg) || Object.keys(msg || {}).find(k => k === 'conversation' || k.endsWith('Message'));
+
+if (!contentType) return { text: null, mediaPart: null };
+
+// 2. Extract text caption or message (Lines 95 - 105)
+let extractedText = null;
+if (contentType === 'conversation') {
+  extractedText = msg.conversation;
+} else if (contentType === 'extendedTextMessage') {
+  extractedText = msg.extendedTextMessage?.text;
+} else if (contentType === 'imageMessage') {
+  extractedText = msg.imageMessage?.caption || null;
+} else if (contentType === 'videoMessage') {
+  extractedText = msg.videoMessage?.caption || null;
+}
 
   // 3. Extract media buffer (for view-once or regular media)
-  let mediaPart = null;
-  const isImage = contentType === 'imageMessage';
-  const isVideo = contentType === 'videoMessage';
+  // 3. Extract media buffer (for view-once or regular media)
+let mediaPart = null;
+const isImage = contentType === 'imageMessage';
+const isVideo = contentType === 'videoMessage';
 
-  if (isImage || isVideo) {
-    try {
-      const buffer = await downloadMediaMessage(
-        fullMessageCtx,
-        'buffer',
-        {},
-        { logger: console }
-      );
+if (isImage || isVideo) {
+  try {
+    const buffer = await downloadMediaMessage(
+      { message: msg, key: fullMessageCtx.key }, // ✅ Pass unwrapped msg inside context
+      'buffer',
+      {},
+      { logger: console }
+    );
 
-      const mimeType = isImage 
-        ? (msg.imageMessage?.mimetype || 'image/jpeg') 
-        : (msg.videoMessage?.mimetype || 'video/mp4');
+    const mimeType = isImage 
+      ? (msg.imageMessage?.mimetype || 'image/jpeg') 
+      : (msg.videoMessage?.mimetype || 'video/mp4');
 
-      mediaPart = {
-        inlineData: {
-          data: buffer.toString('base64'),
-          mimeType: mimeType
-        }
-      };
-    } catch (err) {
-      console.error('Failed to download media buffer:', err);
-    }
+    mediaPart = {
+      inlineData: {
+        data: buffer.toString('base64'),
+        mimeType: mimeType
+      }
+    };
+  } catch (err) {
+    console.error('Failed to download media buffer:', err);
   }
-
-  return { text: extractedText, mediaPart };
 }
+
+return { text: extractedText, mediaPart };
 
 // Web Route for Displaying QR Code
 app.get('/qr', async (req, res) => {
