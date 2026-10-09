@@ -195,74 +195,69 @@ app.get('/qr', async (req, res) => {
     res.status(500).send('Error generating QR Code');
   }
 });
-
+}
 app.get('/', (req, res) => {
   res.send('Phinehas Bot status: Active');
 });
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
 
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: true
-  });
+    const sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: true
+    });
 
-  sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    sock.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect } = update;
+      if (connection === 'close') {
+        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
+        console.log('Connection closed. Reconnecting:', shouldReconnect);
+        if (shouldReconnect) startBot();
+      } else if (connection === 'open') {
+        console.log('✅ Connected to WhatsApp successfully!');
+      }
+    });
 
-    if (qr) {
-      currentQR = qr;
-      isConnected = false;
-    }
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
 
-    if (connection === 'close') {
-      isConnected = false;
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('Connection closed. Reconnecting:', shouldReconnect);
-      if (shouldReconnect) startBot();
-    } else if (connection === 'open') {
-      isConnected = true;
-      currentQR = '';
-      console.log('🤖 WhatsApp Assistant is online as Phinehas!');
-    }
-  });
+      for (const msg of messages) {
+        if (!msg.message || msg.key.fromMe) continue;
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-  if (type !== 'notify') return;
+        const remoteJid = msg.key.remoteJid;
+        const { text, mediaPart } = await parseMessagePayload(msg.message, msg);
 
-  for (const msg of messages) {
-    if (!msg.message || msg.key.fromMe) continue;
+        if (!text && !mediaPart) continue;
 
-    const remoteJid = msg.key.remoteJid;
-    const { text, mediaPart } = await parseMessagePayload(msg.message, msg);
+        let messageInput;
+        if (mediaPart && text) {
+          messageInput = [mediaPart, text];
+        } else if (mediaPart) {
+          messageInput = [mediaPart, "Describe what you see in this image in detail and respond naturally."];
+        } else {
+          messageInput = text;
+        }
 
-    // Prepare content for Gemini (handles text, media, or both)
-    let messageInput = text;
-    if (mediaPart && text) {
-      messageInput = [mediaPart, text];
-    } else if (mediaPart) {
-      messageInput = [mediaPart, "Describe or analyze this media content."];
-    }
+        try {
+          const response = await sendChatMessageWithFallback(remoteJid, messageInput);
+          await sock.sendMessage(remoteJid, { text: response.text });
+          console.log(`📬 Sent reply to ${remoteJid}`);
+        } catch (error) {
+          console.error('Gemini API Error:', error);
+        }
+      }
+    });
 
-    if (!messageInput) continue;
-
-    console.log(`📩 Message from ${remoteJid}:`, text || '[Media Message]');
-
-    try {
-      const response = await sendChatMessageWithFallback(remoteJid, messageInput);
-      await sock.sendMessage(remoteJid, { text: response.text });
-      console.log(`📬 Sent reply to ${remoteJid}`);
-    } catch (error) {
-      console.error('Gemini API Error:', error);
-    }
+  } catch (err) {
+    console.error('Bot startup error:', err);
   }
-});
 }
 
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`🚀 Server listening on port ${PORT}`);
   startBot();
 });
