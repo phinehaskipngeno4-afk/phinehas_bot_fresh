@@ -196,7 +196,7 @@ app.get('/qr', async (req, res) => {
   }
 });
 }
-app.get('/', (req, res) => {
+app.get('/qr', (req, res) => {
   res.send('Phinehas Bot status: Active');
 });
 
