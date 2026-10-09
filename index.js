@@ -162,43 +162,33 @@ if (isImage || isVideo) {
 }
 
 return { text: extractedText, mediaPart };
+  } // Closes parseMessagePayload
 
-// Web Route for Displaying QR Code
-app.get('/qr', async (req, res) => {
-  if (isConnected) {
-    return res.send(`
-      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;">
-        <h2 style="color: #2e7d32;">✅ WhatsApp Bot is active!</h2>
-      </div>
-    `);
-  }
+  // Web Route for Displaying QR Code
+  app.get('/qr', async (req, res) => {
+    if (isConnected) {
+      return res.send(`
+        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;">
+          <h2 style="color: #2e7d32;">✅ WhatsApp Bot is active!</h2>
+        </div>
+      `);
+    }
 
-  if (!currentQR) {
-    return res.send(`
-      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;">
-        <h3>⏳ QR Code generating... Refreshing...</h3>
-        <script>setTimeout(() => location.reload(), 3000);</script>
-      </div>
-    `);
-  }
+    if (!currentQR) {
+      return res.send(`
+        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;">
+          <h3>⌛ QR Code generating... Refreshing...</h3>
+          <script>setTimeout(() => location.reload(), 3000);</script>
+        </div>
+      `);
+    }
 
-  try {
-    const qrImage = await QRCode.toDataURL(currentQR);
-    res.send(`
-      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;">
-        <h2>Scan to Link Phinehas WhatsApp Bot</h2>
-        <img src="${qrImage}" style="width:300px;height:300px;border:1px solid #ccc;padding:10px;border-radius:8px;"/>
-        <script>setTimeout(() => location.reload(), 15000);</script>
-      </div>
-    `);
-  } catch (err) {
-    res.status(500).send('Error generating QR Code');
-  }
-});
-}
-app.get('/qr', (req, res) => {
-  res.send('Phinehas Bot status: Active');
-});
+    // Serve QR code image...
+  });
+
+  app.get('/', (req, res) => {
+    res.send('Phinehas Bot status: Active');
+  });
 
 async function startBot() {
   try {
