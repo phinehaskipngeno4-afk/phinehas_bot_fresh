@@ -164,27 +164,39 @@ if (isImage || isVideo) {
 return { text: extractedText, mediaPart };
   } // Closes parseMessagePayload
 
-  // Web Route for Displaying QR Code
-  app.get('/qr', async (req, res) => {
-    if (isConnected) {
-      return res.send(`
-        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;">
-          <h2 style="color: #2e7d32;">✅ WhatsApp Bot is active!</h2>
-        </div>
-      `);
-    }
+app.get('/qr', async (req, res) => {
+  if (isConnected) {
+    return res.send(`
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;">
+        <h2 style="color: #2e7d32;">✅ WhatsApp Bot is active!</h2>
+      </div>
+    `);
+  }
 
-    if (!currentQR) {
-      return res.send(`
-        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;">
-          <h3>⌛ QR Code generating... Refreshing...</h3>
-          <script>setTimeout(() => location.reload(), 3000);</script>
-        </div>
-      `);
-    }
+  if (!currentQR) {
+    return res.send(`
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;">
+        <h3>⌛ QR Code generating... Refreshing...</h3>
+        <script>setTimeout(() => location.reload(), 3000);</script>
+      </div>
+    `);
+  }
 
-    // Serve QR code image...
-  });
+  try {
+    const qrImageUrl = await qrcode.toDataURL(currentQR);
+    res.send(`
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;">
+        <h2>Scan QR Code with WhatsApp</h2>
+        <img src="${qrImageUrl}" style="border: 2px solid #333; padding: 10px; border-radius: 8px;" />
+        <p>This page auto-refreshes every 15s</p>
+        <script>setTimeout(() => location.reload(), 15000);</script>
+      </div>
+    `);
+  } catch (err) {
+    res.status(500).send('Failed to generate QR code image');
+  }
+});
+
 
   app.get('/', (req, res) => {
     res.send('Phinehas Bot status: Active');
@@ -201,16 +213,23 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect } = update;
-      if (connection === 'close') {
-        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
-        console.log('Connection closed. Reconnecting:', shouldReconnect);
-        if (shouldReconnect) startBot();
-      } else if (connection === 'open') {
-        console.log('✅ Connected to WhatsApp successfully!');
-      }
-    });
+   sock.ev.on('connection.update', (update) => {
+  const { connection, lastDisconnect, qr } = update;
+
+  if (qr) {
+    currentQR = qr; // Saves the QR string for /qr route
+  }
+
+  if (connection === 'close') {
+    isConnected = false;
+    const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
+    if (shouldReconnect) startBot();
+  } else if (connection === 'open') {
+    isConnected = true;
+    currentQR = null; // Clears QR string when logged in
+    console.log('✅ Connected to WhatsApp successfully!');
+  }
+});
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
