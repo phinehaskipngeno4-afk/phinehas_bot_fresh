@@ -78,14 +78,20 @@ async function parseMessagePayload(rawMessage, fullMessageCtx) {
 
   let msg = rawMessage;
 
-  // 1. Safe view-once unwrapping
-  if (msg?.viewOnceMessage?.message) msg = msg.viewOnceMessage.message;
-  else if (msg?.viewOnceMessageV2?.message) msg = msg.viewOnceMessageV2.message;
-  else if (msg?.viewOnceMessageV2Extension?.message) msg = msg.viewOnceMessageV2Extension.message;
+  // 1. Safe recursive view-once unwrapping
+  while (
+    msg?.viewOnceMessage?.message ||
+    msg?.viewOnceMessageV2?.message ||
+    msg?.viewOnceMessageV2Extension?.message
+  ) {
+    msg =
+      msg?.viewOnceMessage?.message ||
+      msg?.viewOnceMessageV2?.message ||
+      msg?.viewOnceMessageV2Extension?.message;
+  }
 
   const contentType = getContentType(msg);
   if (!contentType) return { text: null, mediaPart: null };
-
   // 2. Extract text caption or message
   let extractedText = null;
   if (contentType === 'conversation') {
